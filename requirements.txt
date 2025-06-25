@@ -1,0 +1,8 @@
+flask
+opencv-python
+mediapipe
+protobuf
+numpy
+pandas
+Pillow
+tensorflow
