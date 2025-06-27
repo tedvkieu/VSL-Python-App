@@ -17,3 +17,5 @@ __pycache__/
 # File hệ thống IDE (tuỳ chọn nếu dùng VSCode hoặc khác)
 .vscode/
 .idea/
+data/
+models/

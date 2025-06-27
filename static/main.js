@@ -347,3 +347,7 @@ document.addEventListener('visibilitychange', () => {
 
 // TỰ ĐỘNG BẬT CAMERA KHI LOAD TRANG
 window.addEventListener('DOMContentLoaded', startCamera);
+
+// Thêm event listener cho nút Xóa tất cả và Xóa cuối
+clearAllBtn.addEventListener('click', clearAllLabels);
+removeLastBtn.addEventListener('click', removeLastLabel);

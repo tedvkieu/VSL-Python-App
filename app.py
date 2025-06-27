@@ -11,6 +11,9 @@ import io
 from PIL import Image
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
+import queue
+from config import *
 
 app = Flask(__name__)
 
@@ -24,13 +27,13 @@ except Exception as e:
     model = None
     labels = None
 
-# Khởi tạo Mediapipe
+# Khởi tạo Mediapipe với cấu hình tối ưu
 mp_hands = mp.solutions.hands
 hands = mp_hands.Hands(
     static_image_mode=False, 
-    max_num_hands=2,
-    min_detection_confidence=0.5, 
-    min_tracking_confidence=0.5
+    max_num_hands=MEDIAPIPE_MAX_HANDS,
+    min_detection_confidence=MEDIAPIPE_DETECTION_CONFIDENCE, 
+    min_tracking_confidence=MEDIAPIPE_TRACKING_CONFIDENCE
 )
 mp_draw = mp.solutions.drawing_utils
 
@@ -39,8 +42,14 @@ sequence = []
 collecting = False
 last_prediction = ""
 hand_missing_counter = 0
-missing_threshold = 10
 prediction_confidence = 0.0
+
+# Tối ưu: Thread pool cho xử lý frame
+executor = ThreadPoolExecutor(max_workers=THREAD_POOL_WORKERS)
+frame_queue = queue.Queue(maxsize=10)
+
+# Cache cho landmarks để tránh tính toán lại
+landmarks_cache = {}
 
 def extract_both_hands_landmarks(results):
     """Trích xuất landmarks từ cả hai tay"""
@@ -62,13 +71,16 @@ def extract_both_hands_landmarks(results):
 
 def save_to_csv(sequence_data, prediction):
     """Lưu dữ liệu vào file CSV"""
+    if not SAVE_PREDICTIONS_TO_CSV:
+        return None
+        
     try:
         # Tạo thư mục data nếu chưa có
-        os.makedirs('data', exist_ok=True)
+        os.makedirs(CSV_DATA_DIR, exist_ok=True)
         
         # Tạo tên file dựa trên thời gian hiện tại
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"data/hand_data_{timestamp}.csv"
+        filename = f"{CSV_DATA_DIR}/hand_data_{timestamp}.csv"
         
         # Tạo DataFrame từ sequence
         df = pd.DataFrame(sequence_data)
@@ -84,10 +96,8 @@ def save_to_csv(sequence_data, prediction):
         print(f"Error saving CSV: {e}")
         return None
 
-def process_frame(frame_data):
-    """Xử lý frame từ camera"""
-    global sequence, collecting, last_prediction, hand_missing_counter, prediction_confidence
-    
+def process_single_frame(frame_data):
+    """Xử lý một frame đơn lẻ"""
     try:
         # Decode base64 image
         image_data = base64.b64decode(frame_data.split(',')[1])
@@ -120,16 +130,39 @@ def process_frame(frame_data):
                     })
                 landmarks_data.append(hand_data)
         
+        return {
+            'keypoints': keypoints,
+            'landmarks': landmarks_data,
+            'has_hands': any(k != 0 for k in keypoints)
+        }
+        
+    except Exception as e:
+        print(f"Error processing single frame: {e}")
+        return None
+
+def process_frame(frame_data):
+    """Xử lý frame từ camera (legacy function)"""
+    global sequence, collecting, last_prediction, hand_missing_counter, prediction_confidence
+    
+    try:
+        result = process_single_frame(frame_data)
+        if not result:
+            return {'success': False, 'error': 'Frame processing failed'}
+        
+        keypoints = result['keypoints']
+        landmarks_data = result['landmarks']
+        
         # Process hand detection logic
-        if any(k != 0 for k in keypoints):
+        if result['has_hands']:
             # Phát hiện tay -> bắt đầu thu frame
-            sequence.append(keypoints)
+            if len(sequence) < MAX_SEQUENCE_LENGTH:
+                sequence.append(keypoints)
             collecting = True
             hand_missing_counter = 0
         else:
             if collecting:
                 hand_missing_counter += 1
-                if hand_missing_counter >= missing_threshold:
+                if hand_missing_counter >= MISSING_THRESHOLD:
                     # Tay biến mất -> thực hiện dự đoán
                     if len(sequence) > 0 and model is not None:
                         input_data = np.expand_dims(sequence, axis=0)
@@ -140,7 +173,7 @@ def process_frame(frame_data):
                         
                         print(f"Dự đoán: {max_label} ({confidence:.3f})")
                         
-                        if confidence > 0.9 and max_label != "non-action":
+                        if confidence > MIN_CONFIDENCE and max_label != "non-action":
                             last_prediction = max_label
                             prediction_confidence = confidence
                             # Lưu dữ liệu vào CSV
@@ -167,6 +200,69 @@ def process_frame(frame_data):
         print(f"Error processing frame: {e}")
         return {'success': False, 'error': str(e)}
 
+def process_frame_batch(frames_data):
+    """Xử lý batch frames để tối ưu performance"""
+    global sequence, collecting, last_prediction, hand_missing_counter, prediction_confidence
+    
+    try:
+        # Xử lý frame cuối cùng trong batch (frame mới nhất)
+        last_frame = frames_data[-1]
+        result = process_single_frame(last_frame)
+        
+        if not result:
+            return {'success': False, 'error': 'Frame processing failed'}
+        
+        keypoints = result['keypoints']
+        landmarks_data = result['landmarks']
+        
+        # Process hand detection logic
+        if result['has_hands']:
+            # Phát hiện tay -> bắt đầu thu frame
+            if len(sequence) < MAX_SEQUENCE_LENGTH:
+                sequence.append(keypoints)
+            collecting = True
+            hand_missing_counter = 0
+        else:
+            if collecting:
+                hand_missing_counter += 1
+                if hand_missing_counter >= MISSING_THRESHOLD:
+                    # Tay biến mất -> thực hiện dự đoán
+                    if len(sequence) > 0 and model is not None:
+                        input_data = np.expand_dims(sequence, axis=0)
+                        prediction = model.predict(input_data, verbose=0)[0]
+                        max_index = np.argmax(prediction)
+                        max_label = labels[max_index]
+                        confidence = prediction[max_index]
+                        
+                        print(f"Dự đoán: {max_label} ({confidence:.3f})")
+                        
+                        if confidence > MIN_CONFIDENCE and max_label != "non-action":
+                            last_prediction = max_label
+                            prediction_confidence = confidence
+                            # Lưu dữ liệu vào CSV
+                            save_to_csv(sequence, max_label)
+                        else:
+                            last_prediction = ""
+                            prediction_confidence = 0.0
+                    
+                    # Reset trạng thái
+                    sequence.clear()
+                    collecting = False
+                    hand_missing_counter = 0
+        
+        return {
+            'success': True,
+            'landmarks': landmarks_data,
+            'prediction': last_prediction,
+            'confidence': float(prediction_confidence),
+            'collecting': collecting,
+            'sequence_length': len(sequence)
+        }
+        
+    except Exception as e:
+        print(f"Error processing frame batch: {e}")
+        return {'success': False, 'error': str(e)}
+
 @app.route('/')
 def index():
     """Trang chủ"""
@@ -174,7 +270,7 @@ def index():
 
 @app.route('/process_frame', methods=['POST'])
 def process_frame_endpoint():
-    """API endpoint để xử lý frame"""
+    """API endpoint để xử lý frame (legacy)"""
     try:
         data = request.get_json()
         frame_data = data.get('frame')
@@ -183,6 +279,22 @@ def process_frame_endpoint():
             return jsonify({'success': False, 'error': 'No frame data'})
         
         result = process_frame(frame_data)
+        return jsonify(result)
+        
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)})
+
+@app.route('/process_frame_batch', methods=['POST'])
+def process_frame_batch_endpoint():
+    """API endpoint để xử lý batch frames (tối ưu)"""
+    try:
+        data = request.get_json()
+        frames_data = data.get('frames', [])
+        
+        if not frames_data:
+            return jsonify({'success': False, 'error': 'No frames data'})
+        
+        result = process_frame_batch(frames_data)
         return jsonify(result)
         
     except Exception as e:
@@ -209,5 +321,19 @@ def get_status():
         'model_loaded': model is not None
     })
 
+@app.route('/get_config')
+def get_config():
+    """Lấy cấu hình hiện tại"""
+    return jsonify({
+        'frame_rate': FRAME_RATE,
+        'frame_width': FRAME_WIDTH,
+        'frame_height': FRAME_HEIGHT,
+        'jpeg_quality': JPEG_QUALITY,
+        'batch_size': BATCH_SIZE,
+        'batch_timeout_ms': BATCH_TIMEOUT_MS,
+        'min_confidence': MIN_CONFIDENCE,
+        'missing_threshold': MISSING_THRESHOLD
+    })
+
 if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    app.run(debug=DEBUG_MODE, host=HOST, port=PORT)
